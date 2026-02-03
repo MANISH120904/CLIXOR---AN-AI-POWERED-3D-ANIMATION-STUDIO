@@ -6,7 +6,11 @@ import requests
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from google.genai import errors
 import json
+import asyncio
+from typing import List, Optional, Dict
+import base64
 
 load_dotenv()
 
@@ -14,175 +18,203 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # For prototyping, allow all. In prod, specify ["http://localhost:5173"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 BLENDER_SERVER_URL = "http://localhost:8081/execute"
+BLENDER_VERSION = "5.0"
 API_KEY = os.getenv("GOOGLE_API_KEY")
-
-if not API_KEY:
-    print("WARNING: GOOGLE_API_KEY not found in .env file.")
+MODEL_ID = "gemini-2.0-flash" # Use flash for multimodal capabilities
 
 client = genai.Client(api_key=API_KEY)
 
-class UserRequest(BaseModel):
-    prompt: str
+class ToolRequest(BaseModel):
+    message: str
+    session_history: List[str] = [] # List of previously executed code snippets
+    image: Optional[str] = None # Base64 image string
 
-class AgentResponse(BaseModel):
-    plan: str
-    code: str
-    execution_result: dict
-    qa_feedback: str = None
+async def safe_generate(contents):
+    max_api_retries = 5
+    for attempt in range(max_api_retries):
+        try:
+            return client.models.generate_content(model=MODEL_ID, contents=contents)
+        except errors.ClientError as e:
+            print(f"Gemini API Error: {str(e)}")
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait_time = (attempt * 10) + 15
+                print(f"Rate limit hit. Waiting {wait_time}s before retry (Attempt {attempt+1}/{max_api_retries})...")
+                await asyncio.sleep(wait_time)
+            else:
+                raise e
+    raise Exception("API Limit Reached")
 
-@app.post("/generate", response_model=AgentResponse)
-async def generate_animation(request: UserRequest):
-    if not API_KEY:
-        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY is missing.")
-
-    # --- 1. Director Agent ---
-    print(f"Director receiving prompt: {request.prompt}")
-    director_prompt = f"""
-    You are the **Director Agent** for a 3D animation studio.
-    Your goal is to break down the user's request into a detailed technical plan for a Blender animation.
-    
-    User Request: "{request.prompt}"
-    
-    Output a structured plan including:
-    - Scene setup (lighting, camera).
-    - Objects/Characters to create.
-    - Animation details (movement, timing).
-    - Mood/Style.
-    
-    Keep it concise but technical enough for a Tech Artist to understand.
+async def get_scene_context():
+    context_code = """
+import bpy
+import json
+scene_data = {
+    "objects": [{"name": o.name, "type": o.type, "location": list(o.location)} for o in bpy.data.objects],
+    "active_object": bpy.context.active_object.name if bpy.context.active_object else None
+}
+print("CONTEXT_START" + json.dumps(scene_data) + "CONTEXT_END")
     """
-    
     try:
-        director_response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=director_prompt
-        )
-        plan = director_response.text
-        print(f"Director Plan:\n{plan}")
+        response = requests.post(BLENDER_SERVER_URL, json={"code": context_code}, timeout=5)
+        out = response.json().get("output", "")
+        if "CONTEXT_START" in out:
+            return json.loads(out.split("CONTEXT_START")[1].split("CONTEXT_END")[0])
+    except: pass
+    return {"objects": []}
+
+def repair_code(code: str) -> str:
+    # Fix common Blender 5.0 renames that agents often miss
+    replacements = {
+        'inputs["Transmission"]': 'inputs["Transmission Weight"]',
+        "inputs['Transmission']": "inputs['Transmission Weight']",
+        'inputs["Clearcoat"]': 'inputs["Coat Weight"]',
+        "inputs['Clearcoat']": "inputs['Coat Weight']",
+        'inputs["Specular"]': 'inputs["Specular IOR Level"]',
+        "inputs['Specular']": "inputs['Specular IOR Level']",
+        'inputs["Emission"]': 'inputs["Emission Color"]',
+        "inputs['Emission']": "inputs['Emission Color']",
+        '.spring =': '.stiff =',  # Map deprecated SoftBodySettings.spring to .stiff
+        '.fcurves': '.curves',    # Attempt to fix Action.fcurves -> Action.curves for new Anim system
+        'settings.scale =': 'settings.particle_size =', # Safer fix for ParticleSettings
+        'WORLD_ORIGIN': 'WORLD',   # Fix hallucinated enum value for object alignment
+        'rotation_mode = "NORMAL"': 'rotation_mode = "NOR"', # Fix Particle rotation enum
+        "rotation_mode = 'NORMAL'": "rotation_mode = 'NOR'",  # Fix Particle rotation enum (single quotes)
+        "type='EXTRUDE'": "type='SOLIDIFY'", # Fix hallucinated EXTRUDE modifier
+        'type="EXTRUDE"': 'type="SOLIDIFY"'  # Fix hallucinated EXTRUDE modifier
+    }
+    for old, new in replacements.items():
+        code = code.replace(old, new)
+    return code
+
+@app.post("/interact")
+async def blender_agent_interact(request: ToolRequest):
+    # 1. Observe (The 'Agent Context' phase)
+    context = await get_scene_context()
+    
+    # 2. Reason & Action (The 'Agent Thought' phase)
+    agent_prompt = f"""
+    You are a Blender Agent with direct access to a Python Tool.
+    
+    User Goal: "{request.message}"
+    
+    **CURRENT SCENE CONTEXT:**
+    {json.dumps(context)}
+    
+    **PREVIOUSLY EXECUTED IN THIS SESSION:**
+    {chr(10).join(request.session_history[-5:]) if request.session_history else "No previous commands."}
+    
+    **TASK:**
+    Reason about the user's request (and image if provided) and output a JSON object with your thought and the python code.
+    If an image is provided, analyze its visual features (shape, color, composition) and try to recreate them in Blender using Python.
+    
+    **OUTPUT FORMAT (MANDATORY):**
+    {{
+        "thought": "your reasoning here",
+        "code": "your blender python code here"
+    }}
+    
+    - **INCREMENTAL**: Do NOT clear the scene unless asked.
+    - **COMPLEXITY**: UNLEASH full creativity. Do NOT simplify. Use complex geometry, loops, modifiers (Subsurf, Bevel, Array, Boolean), and detailed procedural materials to achieve professional results.
+    - **ORGANIC MODELING STRATEGY**: For complex organic characters (like animals, monsters, dragons):
+        - **Metaballs**: Use `bpy.ops.object.metaball_add()` to "sculpt" with blobs. It is the best way to code organic shapes.
+        - **Blocking**: Assemble the shape using scaled spheres/cylinders/cones, then join them (`bpy.ops.object.join()`) and Remesh (`bpy.ops.object.modifier_add(type='REMESH')`).
+        - **Displacement**: Use Noise textures in a Displace modifier to add detail to skin/scales.
+    - **CRITICAL BLENDER 5.0 API RENAMES**:
+        - **Principled BSDF**: "Transmission" -> "Transmission Weight", "Clearcoat" -> "Coat Weight", "Specular" -> "Specular IOR Level", "Emission" -> "Emission Color".
+        - **SoftBodySettings**: ".spring" is removed. Use **".stiff"** (edge stiffness) or **".bend"** (bending stiffness).
+        - **Animation**: `Action.fcurves` DOES NOT EXIST. Use `action.curves` or prefer `obj.keyframe_insert()` which handles curves automatically.
+        - **Particles**: `psys.settings.scale` is WRONG. Use `psys.settings.particle_size`. Rotation mode 'NORMAL' is WRONG. Use 'NOR'.
+        - **Object Creation**: Use `align='WORLD'` instead of `align='WORLD_ORIGIN'`.
+        - **Modifiers**: 'EXTRUDE' is NOT a modifier. Use 'SOLIDIFY' to give thickness.
+        - ALWAYS check socket/attribute existence before access.
+    - **MERCURY LOOK**: High Metallic (1.0), Low Roughness (0.05), Color: (0.8, 0.8, 0.8, 1.0).
+    - **NODE SAFETY**: When accessing nodes, it is safer to iterate and check type (e.g., `[n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'][0]`) than using names like 'Principled BSDF'.
+    
+    Output ONLY the JSON. No conversational text outside the block.
+    """    
+    request_contents = [agent_prompt]
+    
+    if request.image:
+        try:
+            # Handle base64 string (remove data URI scheme if present)
+            if "base64," in request.image:
+                base64_data = request.image.split("base64,")[1]
+            else:
+                base64_data = request.image
+                
+            image_bytes = base64.b64decode(base64_data)
+            
+            # Create a Part object for the image
+            image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg") # Defaulting to jpeg, sdk handles most common
+            request_contents.append(image_part)
+            print("Image attached to request.")
+        except Exception as e:
+            print(f"Error processing image: {e}")
+
+    res = await safe_generate(request_contents)
+    text = res.text.strip()
+    
+    # Robust JSON extraction
+    try:
+        # 1. Try standard markdown block
+        if "```json" in text:
+            json_str = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text: # Maybe they forgot 'json' tag
+            json_str = text.split("```")[1].strip()
+        else:
+            # 2. Try finding the outer braces
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start != -1 and end != -1:
+                json_str = text[start:end]
+            else:
+                json_str = text # Hope for the best
+            
+        agent_data = json.loads(json_str)
     except Exception as e:
-        print(f"Director Agent Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Director Agent failed: {str(e)}")
-
-    # --- 2. Tech Artist Agent ---
-    print("Tech Artist generating code...")
-    artist_prompt = f"""
-    You are the **Tech Artist Agent**. You write Python code for Blender (bpy).
-    
-    Director's Plan:
-    {plan}
-    
-    **Instructions:**
-    - Write a complete, executable Python script for Blender.
-    - Start with `import bpy`.
-    - Clear existing objects at the start:
-      ```python
-      bpy.ops.object.select_all(action='DESELECT')
-      # Use valid types for Blender 4.x: 'MESH', 'CURVE', 'SURFACE', 'META', 'FONT', 'ARMATURE', 'LATTICE', 'EMPTY', 'LIGHT', 'CAMERA', 'SPEAKER', 'GREASEPENCIL' (NOT 'GPENCIL')
-      for obj_type in ['MESH', 'CURVE', 'SURFACE', 'META', 'FONT', 'ARMATURE', 'LATTICE', 'EMPTY', 'LIGHT', 'CAMERA', 'SPEAKER', 'GREASEPENCIL']:
-          bpy.ops.object.select_by_type(type=obj_type)
-      bpy.ops.object.delete()
-      ```
-    - Setup the scene, objects, and animation based on the plan.
-    - Ensure the camera is positioned to see the action.
-    - **CRITICAL**: Do NOT use infinite loops or modal operators that block execution.
-    - **CRITICAL**: When setting colors, ALWAYS use a tuple of 4 floats `(R, G, B, A)`.
-    - **CRITICAL**: When setting vectors, use tuples of 3 floats `(x, y, z)`.
-    - **CRITICAL**: Before accessing `.use_nodes`, ensure the material or world object exists.
-        - **NEVER** assume a material exists. **ALWAYS** create it: `mat = bpy.data.materials.new(name="MyMaterial")`.
-        - **ALWAYS** check if an object is not None before accessing attributes like `.use_nodes`.
-        - Example: `if mat: mat.use_nodes = True`
-    - **CRITICAL**: Object Linking:
-        - **Do NOT** manually link objects created with `bpy.ops` (e.g., `bpy.ops.mesh.primitive_cube_add()`). They are linked automatically. attempting to link them again will CRASH the script.
-        - **ONLY** manually link objects created via `bpy.data.objects.new(...)`.
-    - **CRITICAL**: Blender 4.0+ API Changes:
-        - In the **Principled BSDF** node:
-            - "Transmission" is now **"Transmission Weight"**.
-            - "Clearcoat" is now **"Coat Weight"**.
-            - "Specular" is now **"Specular IOR Level"**.
-        - Always use the new socket names to avoid `KeyError`.
-    - **CRITICAL**: **DO NOT** use `if __name__ == "__main__":`.
-        - The script is executed via `exec()`, so `__name__` will NOT be "__main__".
-        - Call your functions directly at the end of the script.
-        - Example:
-          ```python
-          setup_scene()
-          create_objects()
-          animate()
-          ```
-    - **CRITICAL**: Add `print("Created: <Object Name>")` after creating each major object.
-    - Output ONLY the raw Python code. Do not include markdown backticks (```python ... ```).
-    """
-    
-    try:
-        artist_response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=artist_prompt
-        )
+        print(f"JSON Parse Error: {e}")
+        print(f"RAW TEXT RECEIVED:\n{text}\n----------------")
         
-        # Clean up code format if Gemini adds markdown
-        code = artist_response.text.strip()
-        if code.startswith("```"):
-            code = code.split("\n", 1)[1]
-        if code.endswith("```"):
-            code = code.rsplit("\n", 1)[0]
-        
-        print(f"Generated Code (first 100 chars): {code[:100]}...")
-    except Exception as e:
-        print(f"Tech Artist Agent Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Tech Artist Agent failed: {str(e)}")
+        # Extreme fallback: try to find any python block if JSON failed
+        if "```python" in text:
+            python_code = text.split("```python")[1].split("```")[0].strip()
+            agent_data = {"thought": "Recovered from python block. JSON parsing failed.", "code": python_code}
+        else:
+            agent_data = {"thought": "Failed to parse agent output. See console for raw text.", "code": "print('Error: Agent output was not valid JSON')"}
 
-    # --- 3. Execution (Blender MCP) ---
-    print("Sending to Blender...")
-    execution_result = {}
-    try:
-        response = requests.post(BLENDER_SERVER_URL, json={"code": code})
-        execution_result = response.json()
-    except Exception as e:
-        execution_result = {"success": False, "error": f"Failed to connect to Blender: {str(e)}", "output": ""}
-        print(f"Blender Connection Error: {e}")
+    # Fix code for Blender 5.0
+    agent_data['code'] = repair_code(agent_data['code'])
 
-    # --- 4. Vision QA Agent ---
-    # In a full version, we would send the rendered image. 
-    # For now, we analyze the execution output and the plan.
-    print("Vision QA analyzing result...")
-    
-    qa_context = f"""
-    You are the **Vision QA Agent**. Analyze the execution of the 3D generation.
-    
-    Director's Plan: {plan}
-    
-    Execution Output: {execution_result.get('output', '')}
-    Execution Error: {execution_result.get('error', '')}
-    Success Status: {execution_result.get('success', False)}
-    
-    Provide a brief critique. Did it crash? Did it seem to generate the objects requested?
-    """
-    
+    # 3. Tool Execution (The 'MCP Call')
+    print(f"Tool Call: {agent_data['thought']}")
     try:
-        qa_response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=qa_context
-        )
-        qa_feedback = qa_response.text
-        print(f"QA Feedback: {qa_feedback}")
+        exec_response = requests.post(BLENDER_SERVER_URL, json={"code": agent_data['code']}, timeout=120)
+        exec_data = exec_response.json()
     except Exception as e:
-        print(f"QA Agent Error: {e}")
-        qa_feedback = "QA Agent unavailable."
+        exec_data = {"success": False, "error": str(e), "output": ""}
 
     return {
-        "plan": plan,
-        "code": code,
-        "execution_result": execution_result,
-        "qa_feedback": qa_feedback
+        "thought": agent_data['thought'],
+        "code": agent_data['code'],
+        "execution": exec_data,
+        "new_context": await get_scene_context()
     }
 
+@app.post("/reset")
+async def reset_scene():
+    reset_code = "import bpy; bpy.ops.wm.read_factory_settings(use_empty=True)"
+    try:
+        requests.post(BLENDER_SERVER_URL, json={"code": reset_code}, timeout=10)
+        return {"status": "success"}
+    except:
+        return {"status": "failed"}
+
 @app.get("/health")
-def health_check():
-    return {"status": "running"}
+def health(): return {"status": "ok"}

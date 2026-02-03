@@ -15,8 +15,8 @@ start "Gemini Frontend" cmd /k "cd frontend && npm run dev"
 
 :: 3. Start Blender Bridge
 echo Attempting to start Blender Bridge...
-echo Using Blender at: "C:\Program Files\Blender Foundation\Blender 4.5\blender.exe"
-start "Blender MCP Server" cmd /k ""C:\Program Files\Blender Foundation\Blender 4.5\blender.exe" --python blender_bridge\blender_server.py"
+echo Using Blender at: "C:\Program Files\Blender Foundation\Blender 5.0\blender.exe"
+start "Blender MCP Server" cmd /k ""C:\Program Files\Blender Foundation\Blender 5.0\blender.exe" --python blender_bridge\blender_server.py"
 
 echo.
 echo All services launched!

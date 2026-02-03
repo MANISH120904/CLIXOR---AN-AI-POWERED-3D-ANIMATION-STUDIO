@@ -86,10 +86,15 @@ def execute_queued_tasks():
                 # 1. Execute Code
                 exec(code, {'bpy': bpy, 'render_dir': RENDER_DIR})
                 
-                # 2. Force Viewport Update
+                # 2. Force Global Viewport & UI Update
                 for window in bpy.context.window_manager.windows:
                     for area in window.screen.areas:
                         area.tag_redraw()
+                        if area.type == 'VIEW_3D':
+                            # Force shading mode to Material Preview to see colors/lights
+                            for space in area.spaces:
+                                if space.type == 'VIEW_3D':
+                                    space.shading.type = 'MATERIAL'
                 
                 success = True
             except Exception:
