@@ -5,7 +5,7 @@ from google.genai import errors
 api_key = "AIzaSyAlyz30NKmpKu5uSSuyAMpCc-wLs4RJI_s"
 client = genai.Client(api_key=api_key)
 
-models_to_test = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", "gemini-2.5-flash"]
+models_to_test = ["gemini-3-flash-preview", "gemini-pro-latest", "gemini-2.0-flash-lite"]
 
 print(f"--- Diagnosing API Key: {api_key[:10]}... ---")
 
