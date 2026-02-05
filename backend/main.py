@@ -88,15 +88,30 @@ def repair_code(code: str) -> str:
         "type='EXTRUDE'": "type='SOLIDIFY'", # Fix hallucinated EXTRUDE modifier
         'type="EXTRUDE"': 'type="SOLIDIFY"',  # Fix hallucinated EXTRUDE modifier
         '.fcurves': '.keyframe_insert',  # Action.fcurves does not exist in Blender 5.0.1, use keyframe_insert() instead
+        '.use_contact_shadow': '# contact shadow removed in Blender 5.0+',  # Remove deprecated attribute
+        'use_contact_shadow =': '# contact shadow removed in Blender 5.0+:',  # Remove deprecated attribute assignments
+        'ShaderNodeTexMusgrave': 'ShaderNodeTexNoise',  # Musgrave noise doesn't exist, use Noise texture instead
+        'ShaderNodeTexCellular': 'ShaderNodeTexNoise',  # Cellular noise replaced with generic Noise
+        'rigidbody_world.animation_data': 'None # rigidbody_world.animation_data is not accessible',  # Cannot access animation_data on RigidBody World
+        '.animation_data' : '.animation_data if hasattr(self, "animation_data") else None',  # Safe access to animation_data
     }
     for old, new in replacements.items():
         code = code.replace(old, new)
     
-    # Ensure materials have use_nodes enabled before shader node operations
-    # This prevents "ShaderNodeTexMusgrave undefined" errors
-    if 'nodes.new(type=' in code and 'use_nodes' not in code:
-        # Add material.use_nodes = True check at the beginning
-        code = 'if hasattr(mat, "use_nodes"): mat.use_nodes = True\n' + code
+    # Additional fixes for common iterator issues
+    # Fix: for x in obj.indices -> for x in obj.users_collection (safer iteration)
+    code = code.replace('for x in obj.indices', 'for x in obj.users_collection')
+    
+    # Fix: for x in obj.locations -> use location directly
+    import re
+    code = re.sub(r'for\s+\w+\s+in\s+\w+\.locations', 'for _ in [obj.location]', code)
+    
+    # Fix rigidbody_world attribute access - wrap in safety checks
+    if 'rigidbody_world' in code and 'animation_data' in code:
+        code = code.replace(
+            'bpy.context.scene.rigidbody_world.animation_data',
+            '(bpy.context.scene.rigidbody_world.animation_data if bpy.context.scene.rigidbody_world and hasattr(bpy.context.scene.rigidbody_world, "animation_data") else None)'
+        )
     
     return code
 
@@ -142,14 +157,53 @@ async def blender_agent_interact(request: ToolRequest):
         - **Animation/Keyframes**: DO NOT use `Action.fcurves` or `Action.curves`. Instead use `obj.keyframe_insert(data_path='rotation_euler', frame=10)` or `obj.keyframe_insert(data_path='location', frame=10)` for direct keyframing.
         - **Particles**: `psys.settings.scale` is WRONG. Use `psys.settings.particle_size`. Rotation mode 'NORMAL' -> 'NOR'.
         - **RigidBody Physics**: `.use_initial_velocity` DOES NOT EXIST. Use keyframes on location to simulate initial momentum.
-        - **RigidBody World**: Do NOT access `.animation_data` directly on `rigidbody_world` (it is None by default). Check `if bpy.context.scene.rigidbody_world.animation_data:` before access.
+        - **RigidBody World**: DO NOT access `.animation_data` on `rigidbody_world`. It DOES NOT EXIST. If you need to animate rigid body physics, use keyframes on object locations/rotations instead.
+        - **Object Attributes**: NEVER try to iterate over `.indices`, `.locations`, or other method-like attributes. Always check if an attribute is callable before trying to iterate.
+        - **Shader Nodes**: NEVER use `ShaderNodeTexMusgrave` or `ShaderNodeTexCellular` - these don't exist. Use `ShaderNodeTexNoise` instead for procedural noise textures.
         - **Object Alignment**: Use `align='WORLD'`, NOT `align='WORLD_ORIGIN'`.
         - **Modifiers**: 'EXTRUDE' is NOT a modifier. Use 'SOLIDIFY' for thickness.
-        - **Shader Nodes**: Always ensure `material.use_nodes = True` before creating shader nodes like ShaderNodeTexMusgrave.
-        - ALWAYS check socket/attribute existence before access using `hasattr()` or try/except.
+        - **World Lighting**: ALWAYS check that `bpy.context.scene.world` is not None before accessing it. If None, create a new world: `world = bpy.data.worlds.new("World"); bpy.context.scene.world = world;`. Then enable nodes: `world.use_nodes = True`.
+        - **Shader Nodes**: Always ensure `material.use_nodes = True` before creating shader nodes. For world lighting, also ensure `world.use_nodes = True`. Check that objects are not None before accessing their properties.
+        - **SAFE ATTRIBUTE ACCESS**: Always use `hasattr()` or try/except blocks when accessing non-standard attributes. Example: `if hasattr(obj, 'animation_data') and obj.animation_data:`.
+        - **ITERATOR SAFETY**: Before iterating over an attribute, verify it's iterable. Never try to iterate over methods or built-in functions. Always check `callable()` first.
     
     - **MERCURY LOOK**: High Metallic (1.0), Low Roughness (0.05), Color: (0.8, 0.8, 0.8, 1.0).
-    - **NODE SAFETY**: When accessing nodes, iterate and check type (e.g., `[n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'][0]`) rather than relying on node names.
+    - **NODE SAFETY**: When accessing nodes, iterate and check type (e.g., `[n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'][0]`) rather than relying on node names. Ensure `mat` is not None and `mat.use_nodes` is True before access.
+    
+    - **POLY HAVEN ASSETS (HIGHLY RECOMMENDED FOR QUALITY MODELS)**:
+        - You have access to `download_polyhaven_asset(search_term, asset_type)` which downloads professional-quality 3D assets.
+        - You have access to `import_polyhaven_model(model_path)` which imports downloaded models into the scene automatically.
+        - **MUST USE FOR**: Objects, furniture, plants, buildings, props, landscapes, HDRIs.
+        - **Asset Types Available**:
+            - `hdris`: Environment lighting (e.g., "forest", "studio", "outdoor", "urban")
+            - `models`: 3D models (e.g., "tree", "rock", "chair", "building", "plant", "grass", "fence", "car", "house")
+            - `textures`: PBR textures (limited support)
+        - **BEST PRACTICES FOR MODELS**:
+            1. Download: `model_path = download_polyhaven_asset("tree", "models")`
+            2. Check: `if model_path: imported_objs = import_polyhaven_model(model_path)`
+            3. Arrange: Position/scale/duplicate imported objects as needed
+            4. **DON'T CODE SIMPLE OBJECTS** - Use Poly Haven instead! A downloaded tree/rock/chair is far better than procedural.
+        - **HDRI WORKFLOW** (for professional lighting):
+            1. Download: `hdri_path = download_polyhaven_asset("studio", "hdris")`
+            2. Load:
+               ```python
+               if hdri_path:
+                   world = bpy.context.scene.world
+                   world.use_nodes = True
+                   bpy.ops.image.open(filepath=hdri_path)
+                   img = bpy.data.images[-1]
+                   env_tex = world.node_tree.nodes.new(type='ShaderNodeTexEnvironment')
+                   env_tex.image = img
+                   world.node_tree.links.new(env_tex.outputs['Color'], 
+                                            world.node_tree.nodes['Background'].inputs['Background'])
+               ```
+        - **PRACTICAL EXAMPLES**:
+            - **Forest scene**: `download("forest", "hdris")` → `download("tree", "models")` → duplicate & scatter
+            - **Interior room**: `download("building", "models")` → `download("chair", "models")` → arrange furniture
+            - **Urban scene**: Multiple `download("building", "models")` → arrange in grid → add appropriate HDRI
+        - **CRITICAL**: Always check `if model_path:` before use. Use `import_polyhaven_model()` to import.
+        - **WHEN TO USE PROCEDURAL**: Only when Poly Haven doesn't have the asset or needs custom variations.
+        - **COMMON SEARCHES TO TRY**: "tree", "rock", "grass", "building", "chair", "plant", "fence", "car", "house", "sofa", "desk", "door", "window", "floor", "wall", "forest", "studio", "outdoor", "urban", "desert", "beach"
     
     Output ONLY the JSON. No conversational text outside the block.
     """    

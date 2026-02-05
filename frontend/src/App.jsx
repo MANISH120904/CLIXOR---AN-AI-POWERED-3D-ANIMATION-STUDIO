@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import './App.css'
+import logo from './assets/logo.png'
 
 function App() {
   const [input, setInput] = useState('')
@@ -89,8 +90,8 @@ function App() {
     <div className="clixor-studio">
       <header className="studio-header">
         <div className="logo-container">
-          <div className="logo-text">CLIXOR</div>
-          <div className="logo-sub">AI 3D ANIMATION STUDIO</div>
+          <img src={logo} alt="Clixor Logo" className="logo-img" />
+          <div className="logo-badge">AI 3D ANIMATION STUDIO</div>
         </div>
         <div className="status-indicator">
           {loading ? 'PROCESSING...' : 'READY'} <span className={`status-dot ${loading ? 'busy' : 'ready'}`}></span>

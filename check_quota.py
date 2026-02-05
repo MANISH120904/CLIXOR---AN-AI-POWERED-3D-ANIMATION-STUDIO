@@ -1,11 +1,13 @@
 import os
+from dotenv import load_dotenv
 from google import genai
 from google.genai import errors
 
-api_key = "AIzaSyAlyz30NKmpKu5uSSuyAMpCc-wLs4RJI_s"
+load_dotenv()
+api_key = os.getenv("GOOGLE_API_KEY")
 client = genai.Client(api_key=api_key)
 
-print(f"Testing API Key: {api_key[:10]}...")
+print(f"Testing API Key: {api_key[:10] if api_key else 'NOT SET'}...")
 
 try:
     # Test 1: List models to see if key is valid

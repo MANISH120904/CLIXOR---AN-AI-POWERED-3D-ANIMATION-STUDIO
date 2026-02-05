@@ -1,8 +1,10 @@
 import os
+from dotenv import load_dotenv
 from google import genai
 from google.genai import errors
 
-api_key = "AIzaSyAlyz30NKmpKu5uSSuyAMpCc-wLs4RJI_s"
+load_dotenv()
+api_key = os.getenv("GOOGLE_API_KEY")
 client = genai.Client(api_key=api_key)
 
 # Using exact names from your check_models.py output
