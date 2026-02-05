@@ -2,7 +2,7 @@ import os
 from google import genai
 from google.genai import errors
 
-api_key = ""
+api_key = os.getenv("GOOGLE_API_KEY")
 client = genai.Client(api_key=api_key)
 
 print(f"Testing API Key: {api_key[:10]}...")
