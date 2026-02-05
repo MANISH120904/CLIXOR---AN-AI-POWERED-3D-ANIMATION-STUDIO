@@ -2,7 +2,7 @@ import os
 from google import genai
 from google.genai import errors
 
-api_key = "AIzaSyAlyz30NKmpKu5uSSuyAMpCc-wLs4RJI_s"
+api_key = os.getenv("GOOGLE_API_KEY")
 client = genai.Client(api_key=api_key)
 
 models_to_test = ["gemini-3-flash-preview", "gemini-pro-latest", "gemini-2.0-flash-lite"]
