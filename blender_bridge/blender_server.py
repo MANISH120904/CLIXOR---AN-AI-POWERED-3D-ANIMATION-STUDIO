@@ -47,11 +47,11 @@ class BlenderRequestHandler(http.server.BaseHTTPRequestHandler):
                 # Put task in queue for the Main Thread
                 execution_queue.put((code, result_container, done_event))
 
-                # Wait for Main Thread to finish execution (timeout 60s)
-                completed = done_event.wait(timeout=60)
+                # Wait for Main Thread to finish execution (timeout 180s for complex operations)
+                completed = done_event.wait(timeout=180)
 
                 if not completed:
-                    response = {"success": False, "error": "Execution timed out (Main thread didn't process task)", "output": ""}
+                    response = {"success": False, "error": "Execution timed out (Main thread didn't process task within 180s)", "output": ""}
                 else:
                     response = result_container
 

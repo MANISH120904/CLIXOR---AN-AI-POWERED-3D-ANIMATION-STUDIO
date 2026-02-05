@@ -27,7 +27,7 @@ app.add_middleware(
 BLENDER_SERVER_URL = "http://localhost:8081/execute"
 BLENDER_VERSION = "5.0"
 API_KEY = os.getenv("GOOGLE_API_KEY")
-MODEL_ID = "gemini-2.0-flash" # Use flash for multimodal capabilities
+MODEL_ID = "gemini-3-flash-preview" # Use gemini-3-flash-preview as requested
 
 client = genai.Client(api_key=API_KEY)
 
@@ -81,16 +81,23 @@ def repair_code(code: str) -> str:
         'inputs["Emission"]': 'inputs["Emission Color"]',
         "inputs['Emission']": "inputs['Emission Color']",
         '.spring =': '.stiff =',  # Map deprecated SoftBodySettings.spring to .stiff
-        '.fcurves': '.curves',    # Attempt to fix Action.fcurves -> Action.curves for new Anim system
         'settings.scale =': 'settings.particle_size =', # Safer fix for ParticleSettings
         'WORLD_ORIGIN': 'WORLD',   # Fix hallucinated enum value for object alignment
         'rotation_mode = "NORMAL"': 'rotation_mode = "NOR"', # Fix Particle rotation enum
         "rotation_mode = 'NORMAL'": "rotation_mode = 'NOR'",  # Fix Particle rotation enum (single quotes)
         "type='EXTRUDE'": "type='SOLIDIFY'", # Fix hallucinated EXTRUDE modifier
-        'type="EXTRUDE"': 'type="SOLIDIFY"'  # Fix hallucinated EXTRUDE modifier
+        'type="EXTRUDE"': 'type="SOLIDIFY"',  # Fix hallucinated EXTRUDE modifier
+        '.fcurves': '.keyframe_insert',  # Action.fcurves does not exist in Blender 5.0.1, use keyframe_insert() instead
     }
     for old, new in replacements.items():
         code = code.replace(old, new)
+    
+    # Ensure materials have use_nodes enabled before shader node operations
+    # This prevents "ShaderNodeTexMusgrave undefined" errors
+    if 'nodes.new(type=' in code and 'use_nodes' not in code:
+        # Add material.use_nodes = True check at the beginning
+        code = 'if hasattr(mat, "use_nodes"): mat.use_nodes = True\n' + code
+    
     return code
 
 @app.post("/interact")
@@ -100,7 +107,9 @@ async def blender_agent_interact(request: ToolRequest):
     
     # 2. Reason & Action (The 'Agent Thought' phase)
     agent_prompt = f"""
-    You are a Blender Agent with direct access to a Python Tool.
+    You are a Blender 5.0.1 Python Agent with direct access to a Python execution tool.
+    
+    **BLENDER VERSION: 5.0.1** (You MUST use Blender 5.0.1 API, NOT older versions)
     
     User Goal: "{request.message}"
     
@@ -126,16 +135,21 @@ async def blender_agent_interact(request: ToolRequest):
         - **Metaballs**: Use `bpy.ops.object.metaball_add()` to "sculpt" with blobs. It is the best way to code organic shapes.
         - **Blocking**: Assemble the shape using scaled spheres/cylinders/cones, then join them (`bpy.ops.object.join()`) and Remesh (`bpy.ops.object.modifier_add(type='REMESH')`).
         - **Displacement**: Use Noise textures in a Displace modifier to add detail to skin/scales.
-    - **CRITICAL BLENDER 5.0 API RENAMES**:
-        - **Principled BSDF**: "Transmission" -> "Transmission Weight", "Clearcoat" -> "Coat Weight", "Specular" -> "Specular IOR Level", "Emission" -> "Emission Color".
-        - **SoftBodySettings**: ".spring" is removed. Use **".stiff"** (edge stiffness) or **".bend"** (bending stiffness).
-        - **Animation**: `Action.fcurves` DOES NOT EXIST. Use `action.curves` or prefer `obj.keyframe_insert()` which handles curves automatically.
-        - **Particles**: `psys.settings.scale` is WRONG. Use `psys.settings.particle_size`. Rotation mode 'NORMAL' is WRONG. Use 'NOR'.
-        - **Object Creation**: Use `align='WORLD'` instead of `align='WORLD_ORIGIN'`.
-        - **Modifiers**: 'EXTRUDE' is NOT a modifier. Use 'SOLIDIFY' to give thickness.
-        - ALWAYS check socket/attribute existence before access.
+    
+    - **CRITICAL BLENDER 5.0.1 API CHANGES** (These are REQUIRED, not optional):
+        - **Principled BSDF Socket Names**: "Transmission" -> "Transmission Weight", "Clearcoat" -> "Coat Weight", "Specular" -> "Specular IOR Level", "Emission" -> "Emission Color".
+        - **SoftBodySettings**: ".spring" is REMOVED. Use **".stiff"** (edge stiffness) or **".bend"** (bending stiffness) instead.
+        - **Animation/Keyframes**: DO NOT use `Action.fcurves` or `Action.curves`. Instead use `obj.keyframe_insert(data_path='rotation_euler', frame=10)` or `obj.keyframe_insert(data_path='location', frame=10)` for direct keyframing.
+        - **Particles**: `psys.settings.scale` is WRONG. Use `psys.settings.particle_size`. Rotation mode 'NORMAL' -> 'NOR'.
+        - **RigidBody Physics**: `.use_initial_velocity` DOES NOT EXIST. Use keyframes on location to simulate initial momentum.
+        - **RigidBody World**: Do NOT access `.animation_data` directly on `rigidbody_world` (it is None by default). Check `if bpy.context.scene.rigidbody_world.animation_data:` before access.
+        - **Object Alignment**: Use `align='WORLD'`, NOT `align='WORLD_ORIGIN'`.
+        - **Modifiers**: 'EXTRUDE' is NOT a modifier. Use 'SOLIDIFY' for thickness.
+        - **Shader Nodes**: Always ensure `material.use_nodes = True` before creating shader nodes like ShaderNodeTexMusgrave.
+        - ALWAYS check socket/attribute existence before access using `hasattr()` or try/except.
+    
     - **MERCURY LOOK**: High Metallic (1.0), Low Roughness (0.05), Color: (0.8, 0.8, 0.8, 1.0).
-    - **NODE SAFETY**: When accessing nodes, it is safer to iterate and check type (e.g., `[n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'][0]`) than using names like 'Principled BSDF'.
+    - **NODE SAFETY**: When accessing nodes, iterate and check type (e.g., `[n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'][0]`) rather than relying on node names.
     
     Output ONLY the JSON. No conversational text outside the block.
     """    
@@ -195,7 +209,7 @@ async def blender_agent_interact(request: ToolRequest):
     # 3. Tool Execution (The 'MCP Call')
     print(f"Tool Call: {agent_data['thought']}")
     try:
-        exec_response = requests.post(BLENDER_SERVER_URL, json={"code": agent_data['code']}, timeout=120)
+        exec_response = requests.post(BLENDER_SERVER_URL, json={"code": agent_data['code']}, timeout=200)
         exec_data = exec_response.json()
     except Exception as e:
         exec_data = {"success": False, "error": str(e), "output": ""}

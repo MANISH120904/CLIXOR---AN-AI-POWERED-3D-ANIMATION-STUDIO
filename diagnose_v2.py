@@ -6,7 +6,7 @@ api_key = "AIzaSyAlyz30NKmpKu5uSSuyAMpCc-wLs4RJI_s"
 client = genai.Client(api_key=api_key)
 
 # Using exact names from your check_models.py output
-models_to_test = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+models_to_test = ["gemini-3-flash-preview", "gemini-pro-latest", "gemini-2.0-flash-lite"]
 
 print(f"--- Diagnosing API Key: {api_key[:10]}... ---")
 
